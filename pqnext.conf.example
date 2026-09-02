@@ -1,0 +1,21 @@
+# pqnext configuration
+#
+# Docker image for each generator (see `pqnext list` for names). Overrides
+# the default baked into generators.go.
+generator.theia=ghcr.io/achilleaseconomopoulos/pqnext-theia:latest
+
+# Default CBOMkit backend base URL used by `pqnext scan` when --server isn't
+# passed. It must use an IP literal and HTTPS, for example:
+# server.cbomkit=https://<server-ip>:8443
+# Leave empty to require --server explicitly.
+server.cbomkit=
+
+# Private CA and client identity used for CBOMkit mTLS. Relative paths are
+# resolved from this configuration file's directory.
+tls.cbomkit.ca=
+tls.cbomkit.cert=
+tls.cbomkit.key=
+
+# step-ca endpoint used by identity enrollment and renewal. It must be an
+# absolute HTTPS URL. Leave empty to require --ca-url explicitly.
+server.step-ca=

@@ -15,7 +15,7 @@ import (
 // written to the user's config directory the first time pqnext needs a
 // config file and none exists there yet.
 //
-//go:embed pqnext.conf
+//go:embed pqnext.conf.example
 var defaultConfig []byte
 
 // knownServers are the backend names configurable via server.<name> entries.
