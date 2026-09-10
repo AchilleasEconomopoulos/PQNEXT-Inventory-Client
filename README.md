@@ -103,15 +103,15 @@ created first from the built-in default template.
 pqnext identity enroll \
   --ca-url https://<ca-ip>:9000 \
   --root /path/to/ca.crt \
-  --token-file /path/to/client.token \
+  --token '<one-time-token>' \
   --name scanner-001
 ```
 
 Generates a private key locally and exchanges the one-time token for a
-`clientAuth` certificate using step-ca's native Go client. The token file must
-be a regular file readable only by its owner (normally mode `0600`). `--name`
-is optional; when present, enrollment rejects a certificate with a different
-common name.
+`clientAuth` certificate using step-ca's native Go client. Pass the token
+directly to `--token`; quoting it prevents the shell from interpreting token
+characters. `--name` is optional; when present, enrollment rejects a
+certificate with a different common name.
 
 The root CA is copied to `tls.cbomkit.ca`, and the new certificate and key are
 written to `tls.cbomkit.cert` and `tls.cbomkit.key`. Existing certificate or key

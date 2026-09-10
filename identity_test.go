@@ -23,8 +23,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/smallstep/certificates/api"
 )
 
 func TestEnrollAndRenewIdentity(t *testing.T) {
@@ -40,17 +38,23 @@ func TestEnrollAndRenewIdentity(t *testing.T) {
 		var publicKey crypto.PublicKey
 		switch request.URL.Path {
 		case "/sign":
-			var signRequest api.SignRequest
+			var signRequest caSignRequest
 			if err := json.NewDecoder(request.Body).Decode(&signRequest); err != nil {
 				http.Error(writer, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if signRequest.CsrPEM.CertificateRequest == nil {
+			block, _ := pem.Decode([]byte(signRequest.CSR))
+			if block == nil {
 				http.Error(writer, "missing CSR", http.StatusBadRequest)
 				return
 			}
-			subject = signRequest.CsrPEM.Subject
-			publicKey = signRequest.CsrPEM.PublicKey
+			csr, err := x509.ParseCertificateRequest(block.Bytes)
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadRequest)
+				return
+			}
+			subject = csr.Subject
+			publicKey = csr.PublicKey
 		case "/renew":
 			if request.TLS == nil || len(request.TLS.PeerCertificates) == 0 {
 				http.Error(writer, "missing mTLS identity", http.StatusUnauthorized)
@@ -65,10 +69,12 @@ func TestEnrollAndRenewIdentity(t *testing.T) {
 
 		leaf := issueTestClientCertificate(t, root, rootKey, subject, publicKey, serial.Add(1), now)
 		writer.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(writer).Encode(api.SignResponse{
-			ServerPEM:    api.NewCertificate(leaf),
-			CaPEM:        api.NewCertificate(root),
-			CertChainPEM: []api.Certificate{api.NewCertificate(leaf), api.NewCertificate(root)},
+		leafPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}))
+		rootPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw}))
+		if err := json.NewEncoder(writer).Encode(caSignResponse{
+			Certificate:      leafPEM,
+			CA:               rootPEM,
+			CertificateChain: []string{leafPEM, rootPEM},
 		}); err != nil {
 			t.Errorf("encoding CA response: %v", err)
 		}
@@ -85,11 +91,7 @@ func TestEnrollAndRenewIdentity(t *testing.T) {
 
 	directory := t.TempDir()
 	rootPath := filepath.Join(directory, "bootstrap-root.crt")
-	tokenPath := filepath.Join(directory, "scanner.token")
 	if err := os.WriteFile(rootPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw}), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tokenPath, []byte(testToken("scanner-native")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	credentials := tlsCredentials{
@@ -97,7 +99,7 @@ func TestEnrollAndRenewIdentity(t *testing.T) {
 		CertFile: filepath.Join(directory, "client.crt"),
 		KeyFile:  filepath.Join(directory, "client.key"),
 	}
-	if err := enrollIdentity(server.URL, tokenPath, rootPath, "scanner-native", credentials); err != nil {
+	if err := enrollIdentity(server.URL, testToken("scanner-native"), rootPath, "scanner-native", credentials); err != nil {
 		t.Fatalf("enrollIdentity() error = %v", err)
 	}
 	first, err := loadAndValidateIdentity(credentials, time.Now())
@@ -142,6 +144,14 @@ func TestValidateCAURL(t *testing.T) {
 				t.Fatalf("validateCAURL() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestEnrollIdentityRejectsEmptyToken(t *testing.T) {
+	t.Parallel()
+	err := enrollIdentity("https://ca.example.test", " \n\t", "unused.crt", "", tlsCredentials{})
+	if err == nil || err.Error() != "enrollment token is empty" {
+		t.Fatalf("enrollIdentity() error = %v", err)
 	}
 }
 

@@ -4,13 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,8 +26,6 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
-	"github.com/smallstep/certificates/api"
-	stepca "github.com/smallstep/certificates/ca"
 )
 
 const identityRequestTimeout = 30 * time.Second
@@ -29,10 +34,10 @@ func runIdentityEnroll(args []string, cfg config) error {
 	fs := flag.NewFlagSet("identity enroll", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
-		tokenFile = fs.String("token-file", "", "path to the one-time step-ca enrollment token (required)")
-		rootFile  = fs.String("root", "", "path to the trusted step-ca root CA bundle (required)")
-		caURL     = fs.String("ca-url", "", "step-ca base URL (default: server.step-ca in the config file)")
-		name      = fs.String("name", "", "expected certificate common name (optional safety check)")
+		token    = fs.String("token", "", "one-time step-ca enrollment token (required)")
+		rootFile = fs.String("root", "", "path to the trusted step-ca root CA bundle (required)")
+		caURL    = fs.String("ca-url", "", "step-ca base URL (default: server.step-ca in the config file)")
+		name     = fs.String("name", "", "expected certificate common name (optional safety check)")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: pqnext identity enroll [flags]
@@ -55,8 +60,8 @@ Flags:
 		fs.Usage()
 		return fmt.Errorf("identity enroll does not accept positional arguments")
 	}
-	if *tokenFile == "" {
-		return fmt.Errorf("--token-file is required")
+	if strings.TrimSpace(*token) == "" {
+		return fmt.Errorf("--token is required")
 	}
 	if *rootFile == "" {
 		return fmt.Errorf("--root is required")
@@ -66,7 +71,7 @@ Flags:
 		return err
 	}
 	return withIdentityLock(func() error {
-		return enrollIdentity(endpoint, *tokenFile, *rootFile, strings.TrimSpace(*name), cfg.CBOMKitTLS)
+		return enrollIdentity(endpoint, strings.TrimSpace(*token), *rootFile, strings.TrimSpace(*name), cfg.CBOMKitTLS)
 	})
 }
 
@@ -166,17 +171,10 @@ func validateCAURL(value string) (string, error) {
 	return parsed.String(), nil
 }
 
-func enrollIdentity(caURL, tokenPath, rootPath, expectedName string, credentials tlsCredentials) error {
-	if err := validateSecretFile(tokenPath, "enrollment token"); err != nil {
-		return err
-	}
-	tokenBytes, err := readLimitedFile(tokenPath, 1<<20)
-	if err != nil {
-		return fmt.Errorf("reading enrollment token: %w", err)
-	}
-	token := strings.TrimSpace(string(tokenBytes))
+func enrollIdentity(caURL, token, rootPath, expectedName string, credentials tlsCredentials) error {
+	token = strings.TrimSpace(token)
 	if token == "" {
-		return fmt.Errorf("enrollment token file is empty")
+		return fmt.Errorf("enrollment token is empty")
 	}
 	rootPEM, roots, err := loadRootBundle(rootPath)
 	if err != nil {
@@ -186,26 +184,19 @@ func enrollIdentity(caURL, tokenPath, rootPath, expectedName string, credentials
 		return err
 	}
 
-	transport := newCATransport(roots, nil)
-	client, err := stepca.NewClient(caURL,
-		stepca.WithTransport(rejectRedirects(transport)),
-		stepca.WithCertificate(tls.Certificate{}),
-		stepca.WithTimeout(identityRequestTimeout),
-	)
-	if err != nil {
-		return fmt.Errorf("creating step-ca client: %w", err)
-	}
-	defer client.CloseIdleConnections()
-	req, privateKey, err := stepca.CreateSignRequest(token)
+	req, privateKey, csr, err := createCASignRequest(token)
 	if err != nil {
 		return fmt.Errorf("creating certificate request: %w", err)
 	}
-	if expectedName != "" && req.CsrPEM.Subject.CommonName != expectedName {
-		return fmt.Errorf("enrollment token subject %q does not match --name %q", req.CsrPEM.Subject.CommonName, expectedName)
+	if expectedName != "" && csr.Subject.CommonName != expectedName {
+		return fmt.Errorf("enrollment token subject %q does not match --name %q", csr.Subject.CommonName, expectedName)
 	}
+	baseTransport := newCATransport(roots, nil)
+	defer baseTransport.CloseIdleConnections()
+	transport := rejectRedirects(baseTransport)
 	ctx, cancel := context.WithTimeout(context.Background(), identityRequestTimeout)
 	defer cancel()
-	response, err := client.SignWithContext(ctx, req)
+	response, err := sendCARequest(ctx, caURL+"/sign", req, transport)
 	if err != nil {
 		return fmt.Errorf("enrolling with step-ca: %w", err)
 	}
@@ -250,19 +241,12 @@ func renewIdentity(caURL string, credentials tlsCredentials) (*x509.Certificate,
 	if err != nil {
 		return nil, err
 	}
-	transport := rejectRedirects(newCATransport(roots, &identity))
-	client, err := stepca.NewClient(caURL,
-		stepca.WithTransport(transport),
-		stepca.WithCertificate(tls.Certificate{}),
-		stepca.WithTimeout(identityRequestTimeout),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("creating step-ca client: %w", err)
-	}
-	defer client.CloseIdleConnections()
+	baseTransport := newCATransport(roots, &identity)
+	defer baseTransport.CloseIdleConnections()
+	transport := rejectRedirects(baseTransport)
 	ctx, cancel := context.WithTimeout(context.Background(), identityRequestTimeout)
 	defer cancel()
-	response, err := client.RenewWithContext(ctx, transport)
+	response, err := sendCARequest(ctx, caURL+"/renew", nil, transport)
 	if err != nil {
 		return nil, fmt.Errorf("renewing with step-ca: %w", err)
 	}
@@ -314,19 +298,141 @@ func loadAndValidateIdentity(credentials tlsCredentials, now time.Time) (*x509.C
 	return validateIssuedIdentity(chain, signer, roots, now)
 }
 
-func certificateChain(response *api.SignResponse) ([]*x509.Certificate, error) {
+type caSignRequest struct {
+	CSR string `json:"csr"`
+	OTT string `json:"ott"`
+}
+
+type caSignResponse struct {
+	Certificate      string   `json:"crt"`
+	CA               string   `json:"ca"`
+	CertificateChain []string `json:"certChain"`
+}
+
+type enrollmentTokenClaims struct {
+	Subject string   `json:"sub"`
+	SANs    []string `json:"sans"`
+	Email   string   `json:"email"`
+}
+
+func createCASignRequest(token string) (*caSignRequest, crypto.PrivateKey, *x509.CertificateRequest, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, nil, nil, fmt.Errorf("invalid enrollment token")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decoding enrollment token: %w", err)
+	}
+	var claims enrollmentTokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, nil, nil, fmt.Errorf("decoding enrollment token claims: %w", err)
+	}
+	if claims.Subject == "" {
+		return nil, nil, nil, fmt.Errorf("enrollment token has no subject")
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("generating private key: %w", err)
+	}
+	dnsNames, ipAddresses, emailAddresses, uris := splitCertificateSANs(claims.SANs)
+	if claims.Email != "" {
+		emailAddresses = append(emailAddresses, claims.Email)
+	}
+	template := &x509.CertificateRequest{
+		Subject:            pkix.Name{CommonName: claims.Subject},
+		SignatureAlgorithm: x509.ECDSAWithSHA256,
+		DNSNames:           dnsNames,
+		IPAddresses:        ipAddresses,
+		EmailAddresses:     emailAddresses,
+		URIs:               uris,
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, template, key)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("creating certificate request: %w", err)
+	}
+	csr, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("parsing certificate request: %w", err)
+	}
+	request := &caSignRequest{
+		CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr.Raw})),
+		OTT: token,
+	}
+	return request, key, csr, nil
+}
+
+func splitCertificateSANs(sans []string) (dnsNames []string, ipAddresses []net.IP, emailAddresses []string, uris []*url.URL) {
+	for _, san := range sans {
+		if san == "" {
+			continue
+		}
+		if ip := net.ParseIP(san); ip != nil {
+			ipAddresses = append(ipAddresses, ip)
+		} else if uri, err := url.Parse(san); err == nil && uri.Scheme != "" {
+			uris = append(uris, uri)
+		} else if strings.Contains(san, "@") {
+			emailAddresses = append(emailAddresses, san)
+		} else {
+			dnsNames = append(dnsNames, san)
+		}
+	}
+	return
+}
+
+func sendCARequest(ctx context.Context, endpoint string, body *caSignRequest, transport http.RoundTripper) (*caSignResponse, error) {
+	var requestBody io.Reader = http.NoBody
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("encoding step-ca request: %w", err)
+		}
+		requestBody = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("creating step-ca request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("sending step-ca request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return nil, fmt.Errorf("step-ca returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+	}
+	var result caSignResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding step-ca response: %w", err)
+	}
+	return &result, nil
+}
+
+func certificateChain(response *caSignResponse) ([]*x509.Certificate, error) {
 	if response == nil {
 		return nil, fmt.Errorf("step-ca returned an empty certificate response")
 	}
-	certificates := response.CertChainPEM
+	certificates := response.CertificateChain
 	if len(certificates) == 0 {
-		certificates = []api.Certificate{response.ServerPEM, response.CaPEM}
+		certificates = []string{response.Certificate, response.CA}
 	}
 	chain := make([]*x509.Certificate, 0, len(certificates))
-	for _, certificate := range certificates {
-		if certificate.Certificate != nil {
-			chain = append(chain, certificate.Certificate)
+	for _, encoded := range certificates {
+		if encoded == "" {
+			continue
 		}
+		block, _ := pem.Decode([]byte(encoded))
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("step-ca returned an invalid PEM certificate")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parsing step-ca certificate: %w", err)
+		}
+		chain = append(chain, certificate)
 	}
 	if len(chain) == 0 {
 		return nil, fmt.Errorf("step-ca returned no certificates")
@@ -429,20 +535,6 @@ func (transport redirectRejectingTransport) CloseIdleConnections() {
 	if closer, ok := transport.next.(interface{ CloseIdleConnections() }); ok {
 		closer.CloseIdleConnections()
 	}
-}
-
-func validateSecretFile(path, description string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("checking %s %s: %w", description, path, err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%s %s is not a regular file", description, path)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%s %s is accessible by group or other users; use chmod 600", description, path)
-	}
-	return nil
 }
 
 func readLimitedFile(path string, limit int64) ([]byte, error) {
