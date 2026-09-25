@@ -3,6 +3,7 @@
 # Docker image for each generator (see `pqnext list` for names). Overrides
 # the default baked into generators.go.
 generator.theia=ghcr.io/achilleaseconomopoulos/pqnext-theia:latest
+generator.cbomkit-lib=ghcr.io/achilleaseconomopoulos/pqnext-cbomkit-lib:latest
 
 # Default CBOMkit backend base URL used by `pqnext scan` when --server isn't
 # passed. It must use an IP literal and HTTPS, for example:

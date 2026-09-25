@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -9,10 +10,11 @@ import (
 
 // mergeCBOMs merges several CycloneDX JSON documents into one.
 //
-// The first document is the base: its specVersion, metadata, and every other
-// top-level field are preserved as-is. Components and dependencies from all
-// documents are combined into it, de-duplicated by bom-ref (falling back to
-// name+version+purl, then a content hash, for components).
+// The first document is the base: its specVersion, metadata, and other
+// top-level fields are preserved, except that the merged BOM gets a new serial
+// number. Components and dependencies from all documents are combined into it,
+// de-duplicated by bom-ref (falling back to name+version+purl, then a content
+// hash, for components).
 //
 // This is a STRUCTURAL merge. It intentionally does not reconcile
 // metadata.tools across differing spec versions, and it only understands the
@@ -27,6 +29,18 @@ func mergeCBOMs(docs [][]byte) ([]byte, error) {
 	if err := json.Unmarshal(docs[0], &base); err != nil {
 		return nil, fmt.Errorf("parsing base CBOM: %w", err)
 	}
+	var uuid [16]byte
+	if _, err := rand.Read(uuid[:]); err != nil {
+		return nil, fmt.Errorf("generating merged CBOM serial number: %w", err)
+	}
+	uuid[6] = (uuid[6] & 0x0f) | 0x40 // UUID version 4
+	uuid[8] = (uuid[8] & 0x3f) | 0x80 // RFC 4122 variant
+	serial := fmt.Sprintf("urn:uuid:%x-%x-%x-%x-%x", uuid[:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])
+	serialJSON, err := json.Marshal(serial)
+	if err != nil {
+		return nil, fmt.Errorf("encoding merged CBOM serial number: %w", err)
+	}
+	base["serialNumber"] = serialJSON
 
 	var components []json.RawMessage
 	seenComp := map[string]bool{}

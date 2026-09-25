@@ -35,7 +35,7 @@ func runIdentityEnroll(args []string, cfg config) error {
 	fs.SetOutput(os.Stderr)
 	var (
 		token    = fs.String("token", "", "one-time step-ca enrollment token (required)")
-		rootFile = fs.String("root", "", "path to the trusted step-ca root CA bundle (required)")
+		rootFile = fs.String("root", "", "path to the trusted step-ca root CA bundle (optional safety check)")
 		caURL    = fs.String("ca-url", "", "step-ca base URL (default: server.step-ca in the config file)")
 		name     = fs.String("name", "", "expected certificate common name (optional safety check)")
 	)
@@ -62,9 +62,6 @@ Flags:
 	}
 	if strings.TrimSpace(*token) == "" {
 		return fmt.Errorf("--token is required")
-	}
-	if *rootFile == "" {
-		return fmt.Errorf("--root is required")
 	}
 	endpoint, err := configuredCAURL(*caURL, cfg)
 	if err != nil {
@@ -176,11 +173,24 @@ func enrollIdentity(caURL, token, rootPath, expectedName string, credentials tls
 	if token == "" {
 		return fmt.Errorf("enrollment token is empty")
 	}
-	rootPEM, roots, err := loadRootBundle(rootPath)
+	var rootPEM []byte
+	var roots *x509.CertPool
+	var err error
+	if rootPath != "" {
+		rootPEM, roots, err = loadRootBundle(rootPath)
+	} else if _, statErr := os.Stat(credentials.CAFile); statErr == nil {
+		rootPEM, roots, err = loadRootBundle(credentials.CAFile)
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("checking CA bundle %s: %w", credentials.CAFile, statErr)
+	}
 	if err != nil {
 		return err
 	}
-	if err := checkEnrollmentDestinations(credentials, rootPEM); err != nil {
+	if rootPEM != nil {
+		if err := checkEnrollmentDestinations(credentials, rootPEM); err != nil {
+			return err
+		}
+	} else if err := checkEnrollmentIdentityFiles(credentials); err != nil {
 		return err
 	}
 
@@ -214,6 +224,17 @@ func enrollIdentity(caURL, token, rootPath, expectedName string, credentials tls
 	}
 	if expectedName != "" && leaf.Subject.CommonName != expectedName {
 		return fmt.Errorf("issued certificate common name %q does not match --name %q", leaf.Subject.CommonName, expectedName)
+	}
+	if rootPEM == nil {
+		verified, err := leaf.Verify(x509.VerifyOptions{
+			Roots: roots, Intermediates: certificateIntermediates(chain),
+			KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, CurrentTime: time.Now(),
+		})
+		if err != nil {
+			return fmt.Errorf("verifying issued certificate chain: %w", err)
+		}
+		anchor := verified[0][len(verified[0])-1]
+		rootPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: anchor.Raw})
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
 	if err != nil {
@@ -470,19 +491,23 @@ func validateIssuedIdentity(chain []*x509.Certificate, privateKey crypto.Signer,
 			return nil, fmt.Errorf("client certificate contains a non-client extended key usage: %v", usage)
 		}
 	}
-	intermediates := x509.NewCertPool()
-	for _, certificate := range chain[1:] {
-		intermediates.AddCert(certificate)
-	}
 	if _, err := leaf.Verify(x509.VerifyOptions{
 		Roots:         roots,
-		Intermediates: intermediates,
+		Intermediates: certificateIntermediates(chain),
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		CurrentTime:   now,
 	}); err != nil {
 		return nil, fmt.Errorf("verifying client certificate chain: %w", err)
 	}
 	return leaf, nil
+}
+
+func certificateIntermediates(chain []*x509.Certificate) *x509.CertPool {
+	intermediates := x509.NewCertPool()
+	for _, certificate := range chain[1:] {
+		intermediates.AddCert(certificate)
+	}
+	return intermediates
 }
 
 func loadRootBundle(path string) ([]byte, *x509.CertPool, error) {
@@ -562,12 +587,8 @@ func encodeCertificateChain(chain []*x509.Certificate) []byte {
 }
 
 func checkEnrollmentDestinations(credentials tlsCredentials, rootPEM []byte) error {
-	for _, path := range []string{credentials.CertFile, credentials.KeyFile} {
-		if _, err := os.Lstat(path); err == nil {
-			return fmt.Errorf("refusing to overwrite existing identity file %s", path)
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("checking identity file %s: %w", path, err)
-		}
+	if err := checkEnrollmentIdentityFiles(credentials); err != nil {
+		return err
 	}
 	if existing, err := os.ReadFile(credentials.CAFile); err == nil {
 		if !bytes.Equal(existing, rootPEM) {
@@ -575,6 +596,17 @@ func checkEnrollmentDestinations(credentials tlsCredentials, rootPEM []byte) err
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("checking CA bundle %s: %w", credentials.CAFile, err)
+	}
+	return nil
+}
+
+func checkEnrollmentIdentityFiles(credentials tlsCredentials) error {
+	for _, path := range []string{credentials.CertFile, credentials.KeyFile} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("refusing to overwrite existing identity file %s", path)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("checking identity file %s: %w", path, err)
+		}
 	}
 	return nil
 }

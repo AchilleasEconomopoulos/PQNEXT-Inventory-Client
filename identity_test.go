@@ -26,7 +26,6 @@ import (
 )
 
 func TestEnrollAndRenewIdentity(t *testing.T) {
-	t.Parallel()
 	now := time.Now().Truncate(time.Second)
 	root, rootKey, roots := newTestCA(t, now)
 	serverCertificate := newTestServerCertificate(t, root, rootKey, now)
@@ -116,6 +115,40 @@ func TestEnrollAndRenewIdentity(t *testing.T) {
 	if renewed.Subject.CommonName != "scanner-native" {
 		t.Fatalf("renewed common name = %q", renewed.Subject.CommonName)
 	}
+
+	withoutRoot := tlsCredentials{
+		CAFile:   filepath.Join(directory, "existing-ca.crt"),
+		CertFile: filepath.Join(directory, "second-client.crt"),
+		KeyFile:  filepath.Join(directory, "second-client.key"),
+	}
+	rootPEM, err := os.ReadFile(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(withoutRoot.CAFile, rootPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enrollIdentity(server.URL, testToken("scanner-native"), "", "scanner-native", withoutRoot); err != nil {
+		t.Fatalf("enrollIdentity() without --root error = %v", err)
+	}
+	if _, err := loadAndValidateIdentity(withoutRoot, time.Now()); err != nil {
+		t.Fatalf("validating identity enrolled without --root: %v", err)
+	}
+	assertFileContents(t, withoutRoot.CAFile, rootPEM)
+
+	t.Setenv("SSL_CERT_FILE", rootPath)
+	systemRoot := tlsCredentials{
+		CAFile:   filepath.Join(directory, "system-ca.crt"),
+		CertFile: filepath.Join(directory, "third-client.crt"),
+		KeyFile:  filepath.Join(directory, "third-client.key"),
+	}
+	if err := enrollIdentity(server.URL, testToken("scanner-native"), "", "scanner-native", systemRoot); err != nil {
+		t.Fatalf("enrollIdentity() with system trust error = %v", err)
+	}
+	if _, err := loadAndValidateIdentity(systemRoot, time.Now()); err != nil {
+		t.Fatalf("validating identity enrolled with system trust: %v", err)
+	}
+	assertFileContents(t, systemRoot.CAFile, rootPEM)
 }
 
 func TestValidateCAURL(t *testing.T) {
