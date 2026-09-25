@@ -2,7 +2,7 @@
 
 Runs one or more containerized CBOM generators against a target, merges their
 output into a single CycloneDX CBOM, and optionally posts it to a CBOMkit
-backend. Built-in generators: `theia`.
+backend. Built-in generators: `theia` and `cbomkit-lib`.
 
 ## Prerequisites
 
@@ -44,18 +44,24 @@ into one, writes it to `--output`, and (if `--server` is set) posts it to the
 backend. If some generators fail, the rest are still merged; the command only
 errors if *all* of them fail.
 
+Directory scans run both generators by default. Image scans run only `theia`:
+`cbomkit-lib` scans source directories, not container images. In automatic
+mode, `cbomkit-lib` scans Python, Go, and C#; it skips Java unless compiled
+classes or dependency JARs are supplied through its own CLI. This integration
+does not expose those Java options.
+
 **Argument**
 
 | Argument   | Meaning |
 |------------|---------|
-| `<target>` | With `--mode dir`: a path relative to `--workdir` (e.g. `.` or `src`). With `--mode image`: a container image reference (e.g. `alpine:3.19`). |
+| `<target>` | With `--mode dir`: an absolute or relative host directory path (e.g. `.`, `src`, or `/repo/src`). With `--mode image`: a container image reference (e.g. `alpine:3.19`). |
 
 **Flags**
 
 | Flag            | Default            | Description |
 |-----------------|--------------------|-------------|
 | `--mode`        | `dir`              | `dir` scans a directory; `image` scans a container image. |
-| `--workdir`     | `.`                | Host directory mounted at `/workspace` for `dir` scans. `<target>` is relative to this. |
+| `--workdir`     | *(target directory)* | Optional parent directory mounted at `/workspace` for `dir` scans. Relative targets are resolved from this directory when specified. |
 | `--generators`  | *(all)*            | Comma-separated subset to run, e.g. `theia`. Default runs all that support the mode. |
 | `--server`      | `server.cbomkit` in the config file | CBOMkit mTLS base URL, e.g. `https://<server-ip>:8443`. It must use HTTPS and an IP literal. Empty (flag and config) means do not post. |
 | `--output`      | `merged-cbom.json` | Where to write the merged CBOM. |
@@ -70,14 +76,26 @@ errors if *all* of them fail.
 pqnext scan .
 
 # Scan ./src and post the result to a remote backend over mTLS
-pqnext scan --server 'https://<server-ip>:8443' --workdir . src
+pqnext scan --server 'https://<server-ip>:8443' src
+
+# Mount a parent directory when the generator needs access to sibling files
+pqnext scan --workdir /repo src
 
 # Scan a container image with only theia
 pqnext scan --mode image --generators theia alpine:3.19
 
+# Scan a source directory with only cbomkit-lib
+pqnext scan --no-post --generators cbomkit-lib src
+
 # Produce a CBOM without posting, keeping each tool's raw output
 pqnext scan --no-post --keep .
 ```
+
+Each generator keeps its own CycloneDX version and serial number in the raw
+CBOM saved by `--keep`. The merged CBOM receives a new UUID serial number,
+including when only one generator succeeds. The merge keeps the first
+successful generator's CycloneDX version and metadata; the default directory
+order puts `theia` first.
 
 ### `list` — show configured generators
 
@@ -103,25 +121,28 @@ created first from the built-in default template.
 pqnext identity enroll \
   --ca-url https://<ca-ip>:9000 \
   --root /path/to/ca.crt \
-  --token-file /path/to/client.token \
+  --token '<one-time-token>' \
   --name scanner-001
 ```
 
 Generates a private key locally and exchanges the one-time token for a
-`clientAuth` certificate using step-ca's native Go client. The token file must
-be a regular file readable only by its owner (normally mode `0600`). `--name`
-is optional; when present, enrollment rejects a certificate with a different
-common name.
+`clientAuth` certificate using step-ca's native Go client. Pass the token
+directly to `--token`; quoting it prevents the shell from interpreting token
+characters. `--name` is optional; when present, enrollment rejects a
+certificate with a different common name.
 
 The root CA is copied to `tls.cbomkit.ca`, and the new certificate and key are
 written to `tls.cbomkit.cert` and `tls.cbomkit.key`. Existing certificate or key
-files are never overwritten. The configured root is reused only if its contents
-exactly match `--root`.
+files are never overwritten. `--root` is optional. When omitted, enrollment
+uses an existing `tls.cbomkit.ca` file, or the system trust store if that file
+does not exist. In the latter case, it saves the verified trust anchor to
+`tls.cbomkit.ca`. An existing root is reused only if its contents exactly
+match a supplied `--root`.
 
 `--ca-url` may be omitted when `server.step-ca` is configured. The CA URL must
 be an absolute HTTPS URL without credentials, a path, query, or fragment.
-Connections require TLS 1.3, trust only the supplied root, and do not follow
-redirects.
+Connections require TLS 1.3 and do not follow redirects. When `--root` is
+supplied, only that root is trusted for the enrollment connection.
 
 ### `identity renew` — renew the client certificate
 
@@ -188,7 +209,8 @@ lines are ignored:
 ```sh
 # Docker image for each generator (see `pqnext list` for names). Overrides
 # the default baked into generators.go.
-generator.theia=achilleaseconomopoulos/pqnext-theia:latest
+generator.theia=ghcr.io/achilleaseconomopoulos/pqnext-theia:latest
+generator.cbomkit-lib=ghcr.io/achilleaseconomopoulos/pqnext-cbomkit-lib:latest
 
 # Default CBOMkit backend base URL used by `pqnext scan` when --server isn't
 # passed. It must use an IP literal and HTTPS, for example:

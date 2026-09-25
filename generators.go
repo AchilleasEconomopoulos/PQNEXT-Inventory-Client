@@ -6,17 +6,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 )
 
 // Generator describes one CBOM-producing tool that runs as a Docker container.
 //
-// Add a new tool by appending an entry to registry below. Keep Image pinned to
-// a published, versioned tag so every scan host produces reproducible output.
+// Add a new tool by appending an entry to registry below. Use a published,
+// versioned image tag for reproducible output across scan hosts.
 type Generator struct {
 	Name  string   // identifier used with --generators and `list`
-	Image string   // pinned Docker image, e.g. "pqca/cbomkit-theia:1.0.0"
+	Image string   // Docker image, e.g. "pqca/cbomkit-theia:1.0.0"
 	Modes []string // scan modes this tool supports: "dir" and/or "image"
 
 	// Output is where the tool writes its CBOM: "stdout" or "file".
@@ -39,7 +40,8 @@ type invocation struct {
 	gid     int
 
 	// outFile is the container-visible path a "file" generator writes to.
-	// hostOutFile is the same file as seen on the host. Both are set by run().
+	// hostOutFile is the same file in a separate host output directory.
+	// Both are set by run().
 	outFile     string
 	hostOutFile string
 }
@@ -63,6 +65,27 @@ var registry = []Generator{
 				g.Image,
 				in.mode, in.target,
 			}
+		},
+	},
+	{
+		Name:   "cbomkit-lib",
+		Image:  "ghcr.io/achilleaseconomopoulos/pqnext-cbomkit-lib:latest",
+		Modes:  []string{"dir"},
+		Output: "file",
+		buildArgs: func(g Generator, in invocation) []string {
+			args := []string{
+				"run", "--rm",
+				"--volume", in.workdir + ":/workspace:ro",
+				"--volume", filepath.Dir(in.hostOutFile) + ":/output:rw",
+				"--workdir", "/workspace",
+			}
+			if in.uid >= 0 && in.gid >= 0 {
+				args = append(args, "--user", fmt.Sprintf("%d:%d", in.uid, in.gid))
+			}
+			return append(args, g.Image,
+				"--input", path.Join("/workspace", filepath.ToSlash(in.target)),
+				"--output", in.outFile,
+			)
 		},
 	},
 }
@@ -99,17 +122,16 @@ func accepts(g Generator, code int) bool {
 
 // run executes one generator and returns the raw CBOM bytes it produced.
 func (g Generator) run(in invocation) ([]byte, error) {
-	// For file-output tools, allocate a temp file inside the mounted workdir so
-	// the container can write to it and we can read it back on the host.
+	// Keep file output separate from the read-only scan mount. The container
+	// writes into this private directory, and the host reads the result back.
 	if g.Output == "file" {
-		f, err := os.CreateTemp(in.workdir, "."+g.Name+"-cbom-*.json")
+		dir, err := os.MkdirTemp("", "."+g.Name+"-cbom-*")
 		if err != nil {
-			return nil, fmt.Errorf("create temp output: %w", err)
+			return nil, fmt.Errorf("create temp output directory: %w", err)
 		}
-		f.Close()
-		in.hostOutFile = f.Name()
-		defer os.Remove(in.hostOutFile)
-		in.outFile = "/workspace/" + filepath.Base(in.hostOutFile)
+		defer os.RemoveAll(dir)
+		in.hostOutFile = filepath.Join(dir, "cbom.json")
+		in.outFile = "/output/cbom.json"
 	}
 
 	args := g.buildArgs(g, in)

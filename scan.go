@@ -17,7 +17,7 @@ func runScan(args []string, cfg config) error {
 		server     = fs.String("server", "", "CBOMkit backend base URL, e.g. https://<server-ip>:8443 (default: 'server.cbomkit' in the config file, see 'pqnext edit'; empty = do not post)")
 		output     = fs.String("output", "merged-cbom.json", "path to write the merged CBOM")
 		gens       = fs.String("generators", "", "comma-separated generators to run (default: all that support the mode)")
-		workdir    = fs.String("workdir", ".", "host directory mounted at /workspace for dir scans")
+		workdir    = fs.String("workdir", ".", "optional parent directory mounted at /workspace for dir scans")
 		resourceID = fs.String("resource-id", "", "override the backend resource id (default: derived from target)")
 		noPost     = fs.Bool("no-post", false, "do not post even if --server is set")
 		keep       = fs.Bool("keep", false, "keep each generator's raw CBOM as <output>.<generator>.json")
@@ -29,7 +29,7 @@ Runs each configured generator against <target>, merges the CBOMs into one,
 writes it to --output, and (if --server is set) posts it to the backend.
 
 Arguments:
-  <target>   --mode dir:   a path relative to --workdir (e.g. "." or "src")
+  <target>   --mode dir:   a host directory path (e.g. ".", "src", or "/repo/src")
              --mode image: a container image reference (e.g. "alpine:3.19")
 
 Flags:
@@ -77,6 +77,20 @@ Examples:
 	if err != nil {
 		return fmt.Errorf("resolving --workdir: %w", err)
 	}
+	scanTarget := target
+	resourceTarget := target
+	if *mode == "dir" {
+		explicitWorkdir := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "workdir" {
+				explicitWorkdir = true
+			}
+		})
+		absWorkdir, scanTarget, resourceTarget, err = resolveDirScanTarget(target, absWorkdir, explicitWorkdir)
+		if err != nil {
+			return err
+		}
+	}
 
 	selected, err := selectGenerators(*gens, *mode)
 	if err != nil {
@@ -88,7 +102,7 @@ Examples:
 
 	in := invocation{
 		mode:    *mode,
-		target:  target,
+		target:  scanTarget,
 		workdir: absWorkdir,
 		uid:     os.Getuid(),
 		gid:     os.Getgid(),
@@ -133,13 +147,41 @@ Examples:
 	}
 	rid := *resourceID
 	if rid == "" {
-		rid = deriveResourceID(*mode, absWorkdir, target)
+		rid = deriveResourceID(*mode, absWorkdir, resourceTarget)
 	}
 	if err := postCBOM(cbomClient, serverURL, rid, merged); err != nil {
 		return fmt.Errorf("posting to backend: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "posted to %s (resource id: %s)\n", serverURL, rid)
 	return nil
+}
+
+func resolveDirScanTarget(target, workdir string, explicitWorkdir bool) (mountDir, containerTarget, absoluteTarget string, err error) {
+	if explicitWorkdir && !filepath.IsAbs(target) {
+		target = filepath.Join(workdir, target)
+	}
+	absoluteTarget, err = filepath.Abs(target)
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolving scan target: %w", err)
+	}
+	info, err := os.Stat(absoluteTarget)
+	if err != nil {
+		return "", "", "", fmt.Errorf("checking scan target %s: %w", absoluteTarget, err)
+	}
+	if !info.IsDir() {
+		return "", "", "", fmt.Errorf("scan target %s is not a directory", absoluteTarget)
+	}
+	if !explicitWorkdir {
+		return absoluteTarget, ".", absoluteTarget, nil
+	}
+	relativeTarget, err := filepath.Rel(workdir, absoluteTarget)
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolving scan target relative to --workdir: %w", err)
+	}
+	if relativeTarget == ".." || strings.HasPrefix(relativeTarget, ".."+string(filepath.Separator)) {
+		return "", "", "", fmt.Errorf("scan target %s is outside --workdir %s", absoluteTarget, workdir)
+	}
+	return workdir, relativeTarget, absoluteTarget, nil
 }
 
 // selectGenerators returns the generators to run. An empty list means "all that
@@ -179,6 +221,9 @@ func selectGenerators(list, mode string) ([]Generator, error) {
 func deriveResourceID(mode, absWorkdir, target string) string {
 	if mode == "image" {
 		return target
+	}
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target)
 	}
 	return filepath.Clean(filepath.Join(absWorkdir, target))
 }
