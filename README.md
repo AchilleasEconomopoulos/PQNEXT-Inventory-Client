@@ -65,7 +65,7 @@ does not expose those Java options.
 | `--generators`  | *(all)*            | Comma-separated subset to run, e.g. `theia`. Default runs all that support the mode. |
 | `--server`      | `server.cbomkit` in the config file | CBOMkit mTLS base URL, e.g. `https://<server-ip>:8443`. It must use HTTPS and an IP literal. Empty (flag and config) means do not post. |
 | `--output`      | `merged-cbom.json` | Where to write the merged CBOM. |
-| `--resource-id` | *(derived)*        | Override the backend resource id. Default: absolute target path (`dir`) or the image reference (`image`). |
+| `--resource-id` | *(derived)*        | Override the backend resource id. Default: `<hostname>:<absolute-target-path>` (`dir`) or `<hostname>:<image-reference>` (`image`). |
 | `--no-post`     | `false`            | Produce the merged CBOM but skip posting even if `--server` is set. |
 | `--keep`        | `false`            | Also write each generator's raw CBOM as `<output>.<generator>.json` for debugging. |
 
@@ -90,6 +90,10 @@ pqnext scan --no-post --generators cbomkit-lib src
 # Produce a CBOM without posting, keeping each tool's raw output
 pqnext scan --no-post --keep .
 ```
+
+The default resource ID uses the hostname returned by `os.Hostname()`, for
+example `scanner-01:/opt/my-app` or `scanner-01:alpine:3.19`. Renaming the host
+changes the default ID. An explicit `--resource-id` is used unchanged.
 
 Each generator keeps its own CycloneDX version and serial number in the raw
 CBOM saved by `--keep`. The merged CBOM receives a new UUID serial number,

@@ -7,6 +7,31 @@ import (
 	"testing"
 )
 
+func TestDeriveResourceID(t *testing.T) {
+	workdir := t.TempDir()
+	absoluteTarget := filepath.Join(workdir, "src")
+	for _, tt := range []struct {
+		name   string
+		mode   string
+		target string
+		want   string
+	}{
+		{"relative directory", "dir", "src", absoluteTarget},
+		{"absolute directory", "dir", absoluteTarget, absoluteTarget},
+		{"cleaned directory", "dir", "src" + string(filepath.Separator) + ".." + string(filepath.Separator) + "app", filepath.Join(workdir, "app")},
+		{"image reference", "image", "registry.example.com:5000/app:latest", "registry.example.com:5000/app:latest"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, hostname := range []string{"scanner-01", "scanner-02"} {
+				want := hostname + ":" + tt.want
+				if got := deriveResourceID(hostname, tt.mode, workdir, tt.target); got != want {
+					t.Fatalf("resource id = %q, want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestResolveDirScanTarget(t *testing.T) {
 	parent := t.TempDir()
 	target := filepath.Join(parent, "src")

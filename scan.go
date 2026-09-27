@@ -18,7 +18,7 @@ func runScan(args []string, cfg config) error {
 		output     = fs.String("output", "merged-cbom.json", "path to write the merged CBOM")
 		gens       = fs.String("generators", "", "comma-separated generators to run (default: all that support the mode)")
 		workdir    = fs.String("workdir", ".", "optional parent directory mounted at /workspace for dir scans")
-		resourceID = fs.String("resource-id", "", "override the backend resource id (default: derived from target)")
+		resourceID = fs.String("resource-id", "", "override the backend resource id (default: <hostname>:<target>, using the absolute path for dir scans)")
 		noPost     = fs.Bool("no-post", false, "do not post even if --server is set")
 		keep       = fs.Bool("keep", false, "keep each generator's raw CBOM as <output>.<generator>.json")
 	)
@@ -147,7 +147,11 @@ Examples:
 	}
 	rid := *resourceID
 	if rid == "" {
-		rid = deriveResourceID(*mode, absWorkdir, resourceTarget)
+		hostname, err := os.Hostname()
+		if err != nil {
+			return fmt.Errorf("determining hostname for resource id: %w", err)
+		}
+		rid = deriveResourceID(hostname, *mode, absWorkdir, resourceTarget)
 	}
 	if err := postCBOM(cbomClient, serverURL, rid, merged); err != nil {
 		return fmt.Errorf("posting to backend: %w", err)
@@ -215,15 +219,16 @@ func selectGenerators(list, mode string) ([]Generator, error) {
 	return chosen, nil
 }
 
-// deriveResourceID builds the backend resource id from the target. For dir mode
-// it is the absolute, cleaned path (URL-encoding happens at POST time); for
-// image mode it is the image reference itself.
-func deriveResourceID(mode, absWorkdir, target string) string {
-	if mode == "image" {
-		return target
+// deriveResourceID prefixes the target with the hostname. For dir mode the
+// target is the absolute, cleaned path; for image mode it is the image reference.
+// URL-encoding happens at POST time.
+func deriveResourceID(hostname, mode, absWorkdir, target string) string {
+	if mode != "image" {
+		if filepath.IsAbs(target) {
+			target = filepath.Clean(target)
+		} else {
+			target = filepath.Clean(filepath.Join(absWorkdir, target))
+		}
 	}
-	if filepath.IsAbs(target) {
-		return filepath.Clean(target)
-	}
-	return filepath.Clean(filepath.Join(absWorkdir, target))
+	return hostname + ":" + target
 }
