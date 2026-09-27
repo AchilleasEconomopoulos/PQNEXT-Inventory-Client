@@ -13,9 +13,9 @@ server.cbomkit=https://<server-ip>:8443
 
 # Private CA and client identity used for CBOMkit mTLS. Relative paths are
 # resolved from this configuration file's directory.
-tls.cbomkit.ca=
-tls.cbomkit.cert=
-tls.cbomkit.key=
+tls.cbomkit.ca=ca.crt
+tls.cbomkit.cert=client.crt
+tls.cbomkit.key=client.key
 
 # step-ca endpoint used by identity enrollment and renewal. It must be an
 # absolute HTTPS URL. Leave empty to require --ca-url explicitly.
